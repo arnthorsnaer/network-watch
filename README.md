@@ -4,6 +4,8 @@ A macOS tool for diagnosing intermittent network problems that are hard to catch
 
 <img width="1012" height="632" alt="Screenshot 2026-03-30 at 08 07 57" src="https://github.com/user-attachments/assets/c1aabd32-a745-4950-a7d5-ede83602bf2b" />
 
+<img width="912" height="744" alt="Screenshot 2026-03-30 at 08 43 45" src="https://github.com/user-attachments/assets/7238a57d-dab5-4e52-9204-7fb43eb470af" />
+
 ## The Problem It Solves
 
 Intermittent connectivity issues are frustrating to diagnose. The connection drops for 30 seconds, then comes back. By the time you open a browser or call your ISP, everything looks fine. You can't prove anything happened, and you can't tell whether the problem is the WiFi, the router, the ISP, or something else.
