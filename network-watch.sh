@@ -214,7 +214,7 @@ draw_ui() {
     echo
 
     if [[ -n "$G_SSID" ]]; then
-        printf '    %-12s %s  Connected to "%s"\n' "WiFi" "$(_dot $wifi_ok)" "$G_SSID"
+        printf '    %-12s %s  Connected\n' "WiFi" "$(_dot $wifi_ok)"
     elif [[ -n "$G_WIFI_IFACE" ]]; then
         printf '    %-12s %s  Not connected\n' "WiFi" "$(_dot 0)"
     else

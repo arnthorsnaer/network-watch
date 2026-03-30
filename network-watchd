@@ -115,11 +115,7 @@ get_wifi() {
     G_SSID=""
     [[ -z "$G_WIFI_IFACE" ]] && return
     if ipconfig getsummary "$G_WIFI_IFACE" 2>/dev/null | grep -qw SSID; then
-        local ssid
-        ssid=$(system_profiler SPAirPortDataType 2>/dev/null \
-            | awk '/Current Network Information:/{getline; sub(/^[[:space:]]+/,""); sub(/:.*$/,""); print; exit}')
-        [[ "$ssid" == "<redacted>" ]] && ssid=""
-        G_SSID="${ssid:-Connected}"
+        G_SSID="Connected"
     fi
 }
 

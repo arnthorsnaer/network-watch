@@ -39,8 +39,7 @@ struct StatusView: View {
                     dot(status.wifiOK)
                     Text("WiFi")
                         .frame(width: 60, alignment: .leading)
-                    Text(status.wifiOK
-                         ? "Connected to \"\(status.ssid)\""
+                    Text(status.wifiOK ? "Connected"
                          : status.wifiIface.isEmpty ? "No adapter" : "Not connected")
                 }
 
