@@ -457,7 +457,6 @@ format_log_summary() {
 send_log_email() {
     local summary; summary=$(format_log_summary)
     local sent_at; sent_at=$(date '+%Y-%m-%d %H:%M:%S')
-    local boundary="NetworkWatch_$(date +%s)_boundary"
     local tmpfile; tmpfile=$(mktemp /tmp/network-watch-mail.XXXXXX)
 
     {
@@ -466,25 +465,18 @@ send_log_email() {
         printf "Subject: [Network Watch] Log from %s\r\n" "$MACHINE_NAME"
         printf "Date: %s\r\n" "$(date -R)"
         printf "MIME-Version: 1.0\r\n"
-        printf "Content-Type: multipart/mixed; boundary=\"%s\"\r\n" "$boundary"
+        printf "Content-Type: text/plain; charset=UTF-8\r\n"
         printf "\r\n"
 
-        # Summary body part
-        printf -- "--%s\r\n" "$boundary"
-        printf "Content-Type: text/plain; charset=UTF-8\r\n\r\n"
         printf "Machine : %s\r\nSent    : %s\r\n\r\n" "$MACHINE_NAME" "$sent_at"
         printf "SUMMARY \xe2\x80\x94 LAST 24 HOURS:\r\n\r\n"
         echo "$summary" | while IFS= read -r line; do printf "%s\r\n" "$line"; done
-        printf "\r\nFull log attached.\r\n"
-
-        # Log as attachment (base64)
-        printf "\r\n--%s\r\n" "$boundary"
-        printf "Content-Type: text/plain; charset=UTF-8\r\n"
-        printf "Content-Disposition: attachment; filename=\"network-watch.log\"\r\n"
-        printf "Content-Transfer-Encoding: base64\r\n\r\n"
-        base64 "$LOG_FILE" 2>/dev/null || printf "(log not found)\r\n"
-
-        printf "\r\n--%s--\r\n" "$boundary"
+        printf "\r\n\r\nFULL LOG:\r\n\r\n"
+        if [[ -f "$LOG_FILE" ]]; then
+            while IFS= read -r line; do printf "%s\r\n" "$line"; done < "$LOG_FILE"
+        else
+            printf "(log not found)\r\n"
+        fi
     } > "$tmpfile"
 
     if curl --silent --show-error --ssl-reqd \
