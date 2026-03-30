@@ -31,7 +31,12 @@ start_daemon_if_needed() {
         if kill -0 "$pid" 2>/dev/null; then return; fi
         rm -f "$PID_FILE"
     fi
-    nohup "$DAEMON" >> /dev/null 2>&1 &
+    "$DAEMON" &
+    DAEMON_PID=$!
+}
+
+stop_daemon() {
+    [[ -n "${DAEMON_PID:-}" ]] && kill "$DAEMON_PID" 2>/dev/null || true
 }
 
 # Reads the status file written by the daemon into G_ globals
@@ -326,6 +331,8 @@ Keys: [m] minute  [h] hour  [d] day  [l] send log by email
 EOF
         ;;
     *)
+        DAEMON_PID=""
+        trap 'stop_daemon; exit' INT TERM EXIT
         start_daemon_if_needed
 
         # Wait up to 5s for first status file if daemon is freshly started

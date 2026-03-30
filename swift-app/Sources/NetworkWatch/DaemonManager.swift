@@ -1,8 +1,17 @@
 import Foundation
+import AppKit
 
 class DaemonManager: ObservableObject {
     @Published var isRunning = false
     private var process: Process?
+    private var stopping = false
+
+    init() {
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.willTerminateNotification,
+            object: nil, queue: nil
+        ) { [weak self] _ in self?.stop() }
+    }
 
     func startIfNeeded() {
         guard !isRunning else { return }
@@ -31,9 +40,11 @@ class DaemonManager: ObservableObject {
         p.terminationHandler = { [weak self] _ in
             DispatchQueue.main.async {
                 self?.isRunning = false
-            }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
-                self?.startIfNeeded()
+                if self?.stopping == false {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                        self?.startIfNeeded()
+                    }
+                }
             }
         }
 
@@ -60,6 +71,7 @@ class DaemonManager: ObservableObject {
     }
 
     func stop() {
+        stopping = true
         process?.terminate()
         process = nil
     }

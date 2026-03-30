@@ -31,9 +31,11 @@ This layered approach pinpoints where the problem is. If Router fails but Intern
 ## Architecture
 
 - **`network-watchd`** — daemon that runs checks every 30 seconds, writes status and CSV data to `~/Library/Application Support/NetworkWatch/`
-- **`network-watch.sh`** — terminal UI: starts the daemon if needed, shows a live ANSI heatmap
-- **`swift-app/`** — native macOS SwiftUI app that reads the same data files
+- **`network-watch.sh`** — terminal UI: starts the daemon, shows a live ANSI heatmap. The daemon stops when the CLI exits.
+- **`swift-app/`** — native macOS SwiftUI app that reads the same data files. The daemon starts when the app opens and stops when the app quits.
 - **`build.sh`** — builds `NetworkWatch.app` from the Swift source
+
+The daemon only runs while the app or CLI is open — monitoring is intentionally tied to the application lifetime. Gaps in the heatmap where nothing was checked are shown in grey.
 
 ## Setup
 
