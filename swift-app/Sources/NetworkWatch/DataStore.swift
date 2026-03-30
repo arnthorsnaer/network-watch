@@ -15,6 +15,13 @@ class DataStore: ObservableObject {
     private let statusFile: URL
     private let lastEmailFile: URL
     private var timer: Timer?
+    private static let dateFormatter: DateFormatter = {
+        let df = DateFormatter(); df.dateFormat = "yyyy-MM-dd"; return df
+    }()
+
+    deinit {
+        timer?.invalidate()
+    }
 
     init() {
         let support = FileManager.default
@@ -153,9 +160,7 @@ class DataStore: ObservableObject {
         let raw = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !raw.isEmpty else { return "never" }
 
-        let df = DateFormatter()
-        df.dateFormat = "yyyy-MM-dd"
-        let today = df.string(from: Date())
+        let today = Self.dateFormatter.string(from: Date())
 
         if raw.hasPrefix(today) {
             let timePart = String(raw.dropFirst(today.count)).trimmingCharacters(in: .whitespaces)
