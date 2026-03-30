@@ -1,0 +1,626 @@
+#!/usr/bin/env bash
+# network-watchd — network monitoring daemon (no UI)
+# Run by the Swift app or directly. Writes data files read by the CLI and app.
+
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+if [[ ! -f "$SCRIPT_DIR/.env" ]]; then
+    echo "network-watchd: .env not found in $SCRIPT_DIR" >&2
+    exit 1
+fi
+source "$SCRIPT_DIR/.env"
+
+EMAIL_ENABLED=0
+if [[ -n "${ALERT_EMAIL:-}" ]]; then
+    errors=()
+    [[ "${ALERT_EMAIL}" != *@* ]] && errors+=("ALERT_EMAIL looks invalid")
+    [[ -z "${SMTP_USER:-}" ]]     && errors+=("SMTP_USER is not set")
+    [[ -z "${SMTP_FROM:-}" ]]     && errors+=("SMTP_FROM is not set")
+    [[ -z "${SMTP_PASSWORD:-}" ]] && errors+=("SMTP_PASSWORD is not set")
+    [[ -z "${SMTP_URL:-}" ]]      && errors+=("SMTP_URL is not set")
+    if (( ${#errors[@]} > 0 )); then
+        for err in "${errors[@]}"; do echo "network-watchd: $err" >&2; done
+        exit 1
+    fi
+    EMAIL_ENABLED=1
+fi
+
+MACHINE_NAME=$(scutil --get ComputerName 2>/dev/null || hostname)
+CHECK_INTERVAL=30
+REQUIRED_TRANSITIONS=2
+APP_SUPPORT="$HOME/Library/Application Support/NetworkWatch"
+LOG_FILE="$HOME/Library/Logs/NetworkWatch/network-watch.log"
+DATA_FILE="$APP_SUPPORT/checks.csv"
+STATUS_FILE="$APP_SUPPORT/status"
+LAST_EMAIL_FILE="$APP_SUPPORT/last-email.txt"
+STATE_DIR="/tmp/network-watch"
+PID_FILE="$STATE_DIR/daemon.pid"
+
+AIRPORT="/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport"
+
+mkdir -p "$STATE_DIR" "$APP_SUPPORT" "$(dirname "$LOG_FILE")"
+
+# Daemon always logs to file only
+log() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >> "$LOG_FILE"
+}
+
+log_status() {
+    local wifi_ok=0 gw_ok=0 net_ok=0 dns_ok=0 web_ok=0
+    [[ -n "$G_SSID" ]]    && wifi_ok=1
+    (( G_GW_LOSS  < 20 )) && gw_ok=1  || true
+    (( G_NET_LOSS < 20 )) && net_ok=1 || true
+    [[ -n "$G_DNS_SYS" ]] && dns_ok=1
+    [[ "$G_HTTPS" == "200" || "$G_HTTPS" == "301" || "$G_HTTPS" == "302" ]] && web_ok=1
+
+    local overall wifi gw net dns web
+    (( wifi_ok + gw_ok + net_ok + dns_ok + web_ok == 5 )) \
+        && overall="OVERALL:OK" || overall="OVERALL:FAIL"
+    [[ -n "$G_SSID" ]]    && wifi="WiFi:OK"                     || wifi="WiFi:FAIL"
+    (( G_GW_LOSS  < 20 )) && gw="Router:OK(${G_GW_LOSS}%)"     || gw="Router:FAIL(${G_GW_LOSS}%)"
+    (( G_NET_LOSS < 20 )) && net="Internet:OK(${G_NET_LOSS}%)"  || net="Internet:FAIL(${G_NET_LOSS}%)"
+    [[ -n "$G_DNS_SYS" ]] && dns="DNS:OK"                       || dns="DNS:FAIL"
+    (( web_ok ))          && web="Web:OK"                        || web="Web:FAIL"
+
+    log "$(printf '%-13s %-12s %-18s %-20s %-10s %s' "$overall" "$wifi" "$gw" "$net" "$dns" "$web")"
+}
+
+log_datapoint() {
+    local wifi_ok gw_ok net_ok dns_ok https_ok
+    [[ -n "$G_SSID" ]]    && wifi_ok=1 || wifi_ok=0
+    (( G_GW_LOSS < 20 ))  && gw_ok=1  || gw_ok=0
+    (( G_NET_LOSS < 20 )) && net_ok=1 || net_ok=0
+    [[ -n "$G_DNS_SYS" ]] && dns_ok=1 || dns_ok=0
+    [[ "$G_HTTPS" == "200" || "$G_HTTPS" == "301" || "$G_HTTPS" == "302" ]] \
+        && https_ok=1 || https_ok=0
+    printf '%s,%d,%d,%d,%d,%d\n' \
+        "$(date +%s)" $wifi_ok $gw_ok $net_ok $dns_ok $https_ok >> "$DATA_FILE"
+}
+
+# Writes current check state to $STATUS_FILE for the CLI and Swift app to read
+write_status() {
+    local state="$1" now="$2"
+    local wifi_ok=0 gw_ok=0 net_ok=0 dns_ok=0 web_ok=0
+    [[ -n "$G_SSID" ]]    && wifi_ok=1
+    (( G_GW_LOSS  < 20 )) && gw_ok=1  || true
+    (( G_NET_LOSS < 20 )) && net_ok=1 || true
+    [[ -n "$G_DNS_SYS" ]] && dns_ok=1
+    [[ "$G_HTTPS" == "200" || "$G_HTTPS" == "301" || "$G_HTTPS" == "302" ]] && web_ok=1
+    {
+        printf 'checked_at=%s\n' "$now"
+        printf 'state=%s\n'      "$state"
+        printf 'ssid=%s\n'       "${G_SSID}"
+        printf 'wifi_iface=%s\n' "${G_WIFI_IFACE}"
+        printf 'gateway=%s\n'    "${G_GATEWAY}"
+        printf 'gw_loss=%s\n'    "$G_GW_LOSS"
+        printf 'net_loss=%s\n'   "$G_NET_LOSS"
+        printf 'dns_sys=%s\n'    "${G_DNS_SYS}"
+        printf 'https=%s\n'      "$G_HTTPS"
+        printf 'wifi=%d\n'       $wifi_ok
+        printf 'router=%d\n'     $gw_ok
+        printf 'internet=%d\n'   $net_ok
+        printf 'dns=%d\n'        $dns_ok
+        printf 'web=%d\n'        $web_ok
+    } > "$STATUS_FILE"
+}
+
+# ── Network probes ────────────────────────────────────────────────────────────
+
+
+# Sets G_WIFI_IFACE and G_SSID directly (must be called as a plain function, not via $())
+get_wifi() {
+    G_WIFI_IFACE=$(networksetup -listallhardwareports 2>/dev/null | awk '/Wi-Fi/{getline; print $2}' | head -1)
+    G_SSID=""
+    [[ -z "$G_WIFI_IFACE" ]] && return
+    if ipconfig getsummary "$G_WIFI_IFACE" 2>/dev/null | grep -qw SSID; then
+        local ssid
+        ssid=$(system_profiler SPAirPortDataType 2>/dev/null \
+            | awk '/Current Network Information:/{getline; sub(/^[[:space:]]+/,""); sub(/:.*$/,""); print; exit}')
+        [[ "$ssid" == "<redacted>" ]] && ssid=""
+        G_SSID="${ssid:-Connected}"
+    fi
+}
+
+wifi_radio_info() {
+    if [[ -x "$AIRPORT" ]]; then
+        "$AIRPORT" -I 2>/dev/null || echo "(WiFi radio info unavailable)"
+    else
+        echo "(airport utility not found)"
+    fi
+}
+
+get_gateway() {
+    route -n get default 2>/dev/null | awk '/gateway/{print $2}' | head -1
+}
+
+ping_loss() {
+    local host="$1" count="${2:-3}" timeout="${3:-3}"
+    local out; out=$(ping -c "$count" -W "$timeout" -q "$host" 2>/dev/null) || true
+    if [[ -z "$out" ]]; then echo 100; return; fi
+    echo "$out" | awk -F'[,%]' '/packet loss/{
+        for(i=1;i<=NF;i++) if($i ~ /[0-9]+(\.[0-9]+)?/) { printf "%d\n", $i+0.5; exit }
+    }'
+}
+
+dns_resolve() {
+    local host="$1" resolver="${2:-}"
+    if [[ -n "$resolver" ]]; then
+        dig +time=3 +tries=1 +short "$host" "@$resolver" 2>/dev/null | grep -v '^;' | head -1
+    else
+        dig +time=3 +tries=1 +short "$host" 2>/dev/null | grep -v '^;' | head -1
+    fi
+}
+
+https_status() {
+    curl -s --max-time 8 -o /dev/null -w "%{http_code}" https://www.google.com 2>/dev/null || echo "0"
+}
+
+run_checks() {
+    get_wifi
+    G_GATEWAY=$(get_gateway)
+    G_WIFI_INFO=$(wifi_radio_info)
+
+    if [[ -n "$G_GATEWAY" ]]; then
+        G_GW_LOSS=$(ping_loss "$G_GATEWAY" 3 2)
+    else
+        G_GW_LOSS=100
+    fi
+
+    local loss1 loss2
+    loss1=$(ping_loss "8.8.8.8" 3 3)
+    loss2=$(ping_loss "1.1.1.1" 3 3)
+    G_NET_LOSS=$(( loss1 < loss2 ? loss1 : loss2 ))
+
+    G_DNS_SYS=$(dns_resolve "google.com" "")
+    G_DNS_EXT=$(dns_resolve "google.com" "8.8.8.8")
+    G_HTTPS=$(https_status)
+}
+
+diagnose() {
+    if [[ -z "$G_SSID" ]]; then echo "WIFI_DISCONNECTED"; return; fi
+    if (( G_GW_LOSS >= 80 )); then echo "GATEWAY_UNREACHABLE"; return; fi
+    if (( G_NET_LOSS >= 80 )); then echo "INTERNET_DOWN"; return; fi
+    if [[ -z "$G_DNS_SYS" && -n "$G_DNS_EXT" ]]; then echo "DNS_BROKEN"; return; fi
+    if [[ -z "$G_DNS_SYS" && -z "$G_DNS_EXT" ]]; then echo "INTERNET_DOWN"; return; fi
+    local http_ok=0
+    [[ "$G_HTTPS" == "200" || "$G_HTTPS" == "301" || "$G_HTTPS" == "302" ]] && http_ok=1
+    if (( G_NET_LOSS >= 15 || G_GW_LOSS >= 15 || http_ok == 0 )); then echo "DEGRADED"; return; fi
+    echo "OK"
+}
+
+# ── Plain-language copy ───────────────────────────────────────────────────────
+
+failure_headline() {
+    case "$1" in
+        WIFI_DISCONNECTED)    echo "WiFi is disconnected" ;;
+        GATEWAY_UNREACHABLE)  echo "Cannot reach the router" ;;
+        INTERNET_DOWN)        echo "Internet is not working" ;;
+        DNS_BROKEN)           echo "Websites cannot be found by name (DNS failure)" ;;
+        DEGRADED)             echo "Network is unstable (packet loss / errors)" ;;
+        OK)                   echo "Network is working normally" ;;
+        *)                    echo "Unknown network state" ;;
+    esac
+}
+
+failure_explanation() {
+    case "$1" in
+        WIFI_DISCONNECTED)
+            echo "The computer is not connected to any WiFi network. Either WiFi is turned off, the network is out of range, or the Mac was disconnected."
+            ;;
+        GATEWAY_UNREACHABLE)
+            echo "The Mac is connected to WiFi but the router (gateway) is not responding to pings. This usually means the access point or router has a problem, or the WiFi signal is too weak to carry traffic."
+            ;;
+        INTERNET_DOWN)
+            echo "The router is reachable but internet traffic is being blocked or dropped. The problem is likely with the modem, the router's WAN connection, or the internet service provider (ISP)."
+            ;;
+        DNS_BROKEN)
+            echo "The internet connection itself is working (raw IP traffic reaches the outside world) but DNS name resolution is failing. The system DNS server is not responding. This is often a router DNS configuration issue or a stuck resolver process."
+            ;;
+        DEGRADED)
+            echo "The network is partially working but with significant packet loss or HTTPS failures. The connection is unstable. Possible causes: weak WiFi signal, interference on the channel, or intermittent ISP issues."
+            ;;
+    esac
+}
+
+suggest_fix() {
+    case "$1" in
+        WIFI_DISCONNECTED)
+            cat <<'EOF'
+Things to try (in order):
+  1. Look at the WiFi icon in the top-right of the screen — is it greyed out?
+     If so, click it and turn Wi-Fi on.
+  2. If Wi-Fi is on but no network is selected, click the network name and join.
+  3. Turn WiFi off and back on: Apple menu → System Settings → Wi-Fi → toggle off, then on.
+  4. Restart the Mac if the above does not help.
+EOF
+            ;;
+        GATEWAY_UNREACHABLE)
+            cat <<'EOF'
+Things to try (in order):
+  1. Check that the WiFi router/access point has power — the lights should be on.
+  2. Unplug the router from power, wait 30 seconds, plug it back in.
+     Wait 2 minutes for it to fully restart before testing.
+  3. Try moving the Mac closer to the router.
+  4. Check if other devices (phone, tablet) can connect to the same WiFi — if they can't either,
+     the router is the problem; if they can, the Mac's WiFi may need attention.
+EOF
+            ;;
+        INTERNET_DOWN)
+            cat <<'EOF'
+Things to try (in order):
+  1. Check the modem (the box connected to the phone/cable socket) — its lights should be steady.
+     If the WAN/internet light is off or blinking red, the ISP connection is down.
+  2. Unplug the modem from power, wait 60 seconds, plug it back in.
+     If the router is separate from the modem, restart the router too (30 seconds unplugged).
+  3. Check whether neighbours have internet — if this is a wider outage, contact the ISP.
+  4. ISP support number is usually on the back of the router/modem or on the bill.
+EOF
+            ;;
+        DNS_BROKEN)
+            cat <<'EOF'
+Things to try (in order):
+  1. Restart the router — this resolves most DNS issues (unplug, wait 30 seconds, plug in).
+  2. On the Mac, try: Apple menu → System Settings → Network → Wi-Fi → Details… → DNS tab.
+     Click "+" and add: 8.8.8.8 (Google's public DNS). Click OK and Apply.
+  3. If the above does not help, restart the Mac.
+  Note: even though websites don't load, internet is actually working — this is a DNS-only issue.
+EOF
+            ;;
+        DEGRADED)
+            cat <<'EOF'
+Things to try (in order):
+  1. Check the WiFi signal — how many bars does the Mac show? Try moving closer to the router.
+  2. Check if other devices are experiencing slowness at the same time (YouTube buffering, etc.).
+  3. Restart the router (unplug, wait 30 seconds, plug back in).
+  4. Look for interference sources near the router: microwave oven, cordless phone base, baby monitor.
+     Move the router away from these if possible.
+  5. If the problem is frequent, the router may need a firmware update or replacement.
+EOF
+            ;;
+    esac
+}
+
+# ── Email formatting ──────────────────────────────────────────────────────────
+
+wifi_field() {
+    local field="$1"
+    echo "$G_WIFI_INFO" | awk -F': ' -v f="$field" '$1 ~ f {gsub(/^[ \t]+/,"",$1); print $2}'
+}
+
+format_startup_body() {
+    local wifi_ok=0 gw_ok=0 net_ok=0 dns_ok=0 web_ok=0
+    [[ -n "$G_SSID" ]]    && wifi_ok=1
+    (( G_GW_LOSS  < 20 )) && gw_ok=1  || true
+    (( G_NET_LOSS < 20 )) && net_ok=1 || true
+    [[ -n "$G_DNS_SYS" ]] && dns_ok=1
+    [[ "$G_HTTPS" == "200" || "$G_HTTPS" == "301" || "$G_HTTPS" == "302" ]] && web_ok=1
+    local failing=$(( (1-wifi_ok) + (1-gw_ok) + (1-net_ok) + (1-dns_ok) + (1-web_ok) ))
+
+    local overall_str wifi_str gw_str net_str dns_str web_str
+    (( failing == 0 )) \
+        && overall_str="All systems OK" \
+        || overall_str="${failing} check(s) failing at startup"
+    [[ -n "$G_SSID" ]] \
+        && wifi_str="Connected to \"$G_SSID\"" \
+        || wifi_str="Not connected"
+    (( gw_ok )) \
+        && gw_str="Reachable — ${G_GATEWAY:-unknown}  (${G_GW_LOSS}% loss)" \
+        || gw_str="Not reachable — ${G_GATEWAY:-unknown}  (${G_GW_LOSS}% loss)"
+    (( net_ok )) \
+        && net_str="Reachable  (${G_NET_LOSS}% loss)" \
+        || net_str="Not reachable  (${G_NET_LOSS}% loss)"
+    (( dns_ok )) && dns_str="Operational"   || dns_str="Failed"
+    (( web_ok )) && web_str="Web access OK" || web_str="Web access failed"
+
+    local next_note
+    (( failing > 0 )) \
+        && next_note="You will receive an email when all checks recover, with a full incident summary." \
+        || next_note="You will receive an email if a network incident occurs, once it resolves."
+
+    cat <<EOF
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  NETWORK WATCH STARTED
+  Machine: $MACHINE_NAME
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Monitoring interval : ${CHECK_INTERVAL}s
+Alert hysteresis    : ${REQUIRED_TRANSITIONS} consecutive readings
+Log file            : $LOG_FILE
+
+STATUS AT STARTUP:
+  Overall  : $overall_str
+  WiFi     : $wifi_str
+  Router   : $gw_str
+  Internet : $net_str
+  DNS      : $dns_str
+  Web      : $web_str
+
+$next_note
+EOF
+}
+
+format_incident_body() {
+    local labels=("WiFi" "Router" "Internet" "DNS" "Web")
+    local now_ts; now_ts=$(date '+%Y-%m-%d %H:%M:%S')
+
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "  NETWORK INCIDENT RESOLVED"
+    echo "  Machine: $MACHINE_NAME"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo
+    echo "All checks are now passing."
+    echo
+    echo "INCIDENT TIMELINE:"
+
+    local incident_start="" incident_end=""
+    for (( i=0; i<5; i++ )); do
+        local fail_f="$STATE_DIR/inc_failed_${i}"
+        local rec_f="$STATE_DIR/inc_recovered_${i}"
+        if [[ -f "$fail_f" ]]; then
+            local failed_at; failed_at=$(cat "$fail_f")
+            local recovered_at
+            [[ -f "$rec_f" ]] && recovered_at=$(cat "$rec_f") || recovered_at="$now_ts"
+
+            local start_ts end_ts secs dur
+            start_ts=$(date -j -f "%Y-%m-%d %H:%M:%S" "$failed_at"    "+%s" 2>/dev/null || echo 0)
+            end_ts=$(date -j   -f "%Y-%m-%d %H:%M:%S" "$recovered_at" "+%s" 2>/dev/null || echo 0)
+            secs=$(( end_ts - start_ts ))
+            if   (( secs < 60 ));   then dur="${secs}s"
+            elif (( secs < 3600 )); then dur="$(( secs / 60 ))m $(( secs % 60 ))s"
+            else                         dur="$(( secs / 3600 ))h $(( (secs % 3600) / 60 ))m"
+            fi
+            printf "  %-10s  failed %s, recovered %s  (%s)\n" \
+                "${labels[$i]}" "$failed_at" "$recovered_at" "$dur"
+
+            [[ -z "$incident_start" || "$failed_at"    < "$incident_start" ]] && incident_start="$failed_at"
+            [[ -z "$incident_end"   || "$recovered_at" > "$incident_end"   ]] && incident_end="$recovered_at"
+        fi
+    done
+
+    echo
+    if [[ -n "$incident_start" ]]; then
+        printf "  Total window: %s – %s\n" "$incident_start" "$incident_end"
+    fi
+    echo
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "Network Watch is continuing to monitor."
+}
+
+# ── Email delivery ────────────────────────────────────────────────────────────
+
+send_email() {
+    local subject="$1" body="$2"
+
+    if (( EMAIL_ENABLED == 0 )); then
+        log "Email disabled — skipping: $subject"
+        return 0
+    fi
+
+    local tmpfile; tmpfile=$(mktemp /tmp/network-watch-mail.XXXXXX)
+
+    printf "From: Network Watch <%s>\r\nTo: %s\r\nSubject: %s\r\nDate: %s\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=UTF-8\r\n\r\n%s\r\n" \
+        "$SMTP_FROM" "$ALERT_EMAIL" "$subject" "$(date -R)" "$body" > "$tmpfile"
+
+    if curl --silent --show-error --ssl-reqd \
+            --url "$SMTP_URL" \
+            --user "${SMTP_USER}:${SMTP_PASSWORD}" \
+            --mail-from "$SMTP_FROM" \
+            --mail-rcpt "$ALERT_EMAIL" \
+            --upload-file "$tmpfile" \
+            2>>"$LOG_FILE"; then
+        log "Email sent: $subject"
+        date '+%Y-%m-%d %H:%M:%S' > "$LAST_EMAIL_FILE"
+    else
+        log "WARNING: Failed to send email: $subject"
+    fi
+
+    rm -f "$tmpfile"
+}
+
+format_log_summary() {
+    local now_ep; now_ep=$(date +%s)
+    local win_start=$(( now_ep - 86400 ))
+
+    awk -v ws="$win_start" -v we="$now_ep" -v bsize=3600 -v nb=24 \
+    'BEGIN{FS=","; total=0; all_ok=0; wf=0; rf=0; nf=0; df=0; ef=0}
+    /^[0-9]/{
+        e=$1+0; if(e<ws||e>=we) next
+        total++
+        wifi=$2+0; router=$3+0; internet=$4+0; dns=$5+0; web=$6+0
+        if(wifi&&router&&internet&&dns&&web) all_ok++
+        if(!wifi)    wf++
+        if(!router)  rf++
+        if(!internet) nf++
+        if(!dns)     df++
+        if(!web)     ef++
+        bk="b_"int((e-ws)/bsize); bt[bk]++
+        if(wifi&&router&&internet&&dns&&web) bo[bk]++
+    }
+    END{
+        incidents=0
+        for(b=0;b<nb;b++){bk="b_"b; if(bk in bt&&bo[bk]*100/bt[bk]<80) incidents++}
+        pct=(total>0)?int(all_ok*100/total):0
+        printf "Total checks   : %d\n", total
+        printf "All-OK         : %d (%d%%)\n", all_ok, pct
+        printf "Incident hours : %d of 24\n\n", incidents
+        printf "Failures per check (last 24h):\n"
+        if(total>0){
+            printf "  WiFi     : %d checks (%d%%)\n", wf, int(wf*100/total)
+            printf "  Router   : %d checks (%d%%)\n", rf, int(rf*100/total)
+            printf "  Internet : %d checks (%d%%)\n", nf, int(nf*100/total)
+            printf "  DNS      : %d checks (%d%%)\n", df, int(df*100/total)
+            printf "  Web      : %d checks (%d%%)\n", ef, int(ef*100/total)
+        } else {
+            printf "  (no data in last 24 hours)\n"
+        }
+    }' "$DATA_FILE" 2>/dev/null
+}
+
+send_log_email() {
+    local summary; summary=$(format_log_summary)
+    local sent_at; sent_at=$(date '+%Y-%m-%d %H:%M:%S')
+    local boundary="NetworkWatch_$(date +%s)_boundary"
+    local tmpfile; tmpfile=$(mktemp /tmp/network-watch-mail.XXXXXX)
+
+    {
+        printf "From: Network Watch <%s>\r\n" "$SMTP_FROM"
+        printf "To: %s\r\n" "$ALERT_EMAIL"
+        printf "Subject: [Network Watch] Log from %s\r\n" "$MACHINE_NAME"
+        printf "Date: %s\r\n" "$(date -R)"
+        printf "MIME-Version: 1.0\r\n"
+        printf "Content-Type: multipart/mixed; boundary=\"%s\"\r\n" "$boundary"
+        printf "\r\n"
+
+        # Summary body part
+        printf -- "--%s\r\n" "$boundary"
+        printf "Content-Type: text/plain; charset=UTF-8\r\n\r\n"
+        printf "Machine : %s\r\nSent    : %s\r\n\r\n" "$MACHINE_NAME" "$sent_at"
+        printf "SUMMARY \xe2\x80\x94 LAST 24 HOURS:\r\n\r\n"
+        echo "$summary" | while IFS= read -r line; do printf "%s\r\n" "$line"; done
+        printf "\r\nFull log attached.\r\n"
+
+        # Log as attachment (base64)
+        printf "\r\n--%s\r\n" "$boundary"
+        printf "Content-Type: text/plain; charset=UTF-8\r\n"
+        printf "Content-Disposition: attachment; filename=\"network-watch.log\"\r\n"
+        printf "Content-Transfer-Encoding: base64\r\n\r\n"
+        base64 "$LOG_FILE" 2>/dev/null || printf "(log not found)\r\n"
+
+        printf "\r\n--%s--\r\n" "$boundary"
+    } > "$tmpfile"
+
+    if curl --silent --show-error --ssl-reqd \
+            --url "$SMTP_URL" \
+            --user "${SMTP_USER}:${SMTP_PASSWORD}" \
+            --mail-from "$SMTP_FROM" \
+            --mail-rcpt "$ALERT_EMAIL" \
+            --upload-file "$tmpfile" \
+            2>>"$LOG_FILE"; then
+        log "Email sent with log attachment"
+        date '+%Y-%m-%d %H:%M:%S' > "$LAST_EMAIL_FILE"
+    else
+        log "WARNING: Failed to send log email"
+    fi
+
+    rm -f "$tmpfile"
+}
+
+# ── Monitoring loop ───────────────────────────────────────────────────────────
+
+compute_ok_flags() {
+    local w g n d e
+    [[ -n "$G_SSID" ]]    && w=1 || w=0
+    (( G_GW_LOSS  < 20 )) && g=1 || g=0
+    (( G_NET_LOSS < 20 )) && n=1 || n=0
+    [[ -n "$G_DNS_SYS" ]] && d=1 || d=0
+    [[ "$G_HTTPS" == "200" || "$G_HTTPS" == "301" || "$G_HTTPS" == "302" ]] && e=1 || e=0
+    echo "$w $g $n $d $e"
+}
+
+run_monitor() {
+    echo $$ > "$PID_FILE"
+    trap 'rm -f "$PID_FILE"; exit 0' TERM INT
+
+    G_SSID="" G_GATEWAY="" G_GW_LOSS=0 G_NET_LOSS=0
+    G_DNS_SYS="" G_DNS_EXT="" G_HTTPS="0" G_WIFI_INFO=""
+
+    local labels=("WiFi" "Router" "Internet" "DNS" "Web")
+    local confirmed=(1 1 1 1 1)
+    local consec_ok_arr=(0 0 0 0 0)
+    local consec_fail_arr=(0 0 0 0 0)
+    local incident_dirty=0
+
+    rm -f "$STATE_DIR"/inc_failed_* "$STATE_DIR"/inc_recovered_*
+
+    run_checks
+    local now; now=$(date '+%Y-%m-%d %H:%M:%S')
+    local state; state=$(diagnose)
+
+    local cur=(); read -ra cur <<< "$(compute_ok_flags)"
+    confirmed=("${cur[@]}")
+
+    for (( i=0; i<5; i++ )); do
+        if (( confirmed[i] == 0 )); then
+            echo "$now" > "$STATE_DIR/inc_failed_${i}"
+            incident_dirty=1
+        fi
+    done
+
+    log "Network Watch daemon started — interval=${CHECK_INTERVAL}s hysteresis=${REQUIRED_TRANSITIONS}"
+    send_email "[Network Watch] Started on $MACHINE_NAME" "$(format_startup_body)"
+    log_status
+    log_datapoint
+    write_status "$state" "$now"
+
+    while true; do
+        sleep "$CHECK_INTERVAL"
+
+        run_checks
+        now=$(date '+%Y-%m-%d %H:%M:%S')
+        state=$(diagnose)
+        read -ra cur <<< "$(compute_ok_flags)"
+
+        for (( i=0; i<5; i++ )); do
+            if (( cur[i] == 1 )); then
+                (( consec_ok_arr[i]++ ))  || true
+                consec_fail_arr[i]=0
+                if (( confirmed[i] == 0 && consec_ok_arr[i] >= REQUIRED_TRANSITIONS )); then
+                    confirmed[i]=1
+                    echo "$now" > "$STATE_DIR/inc_recovered_${i}"
+                    log "RECOVERED: ${labels[$i]}"
+                fi
+            else
+                (( consec_fail_arr[i]++ )) || true
+                consec_ok_arr[i]=0
+                if (( confirmed[i] == 1 && consec_fail_arr[i] >= REQUIRED_TRANSITIONS )); then
+                    confirmed[i]=0
+                    echo "$now" > "$STATE_DIR/inc_failed_${i}"
+                    rm -f "$STATE_DIR/inc_recovered_${i}"
+                    incident_dirty=1
+                    log "FAILING: ${labels[$i]}"
+                fi
+            fi
+        done
+
+        if (( incident_dirty )); then
+            local all_ok=1
+            for (( i=0; i<5; i++ )); do (( confirmed[i] == 0 )) && all_ok=0; done
+            if (( all_ok )); then
+                log "All checks recovered — sending incident summary"
+                send_email \
+                    "[Network Watch] Incident resolved on $MACHINE_NAME" \
+                    "$(format_incident_body)"
+                rm -f "$STATE_DIR"/inc_failed_* "$STATE_DIR"/inc_recovered_*
+                incident_dirty=0
+            fi
+        fi
+
+        log_status
+        log_datapoint
+        write_status "$state" "$now"
+    done
+}
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+case "${1:-}" in
+    --send-log)
+        G_SSID="" G_GATEWAY="" G_GW_LOSS=0 G_NET_LOSS=0
+        G_DNS_SYS="" G_DNS_EXT="" G_HTTPS="0" G_WIFI_INFO=""
+        send_log_email
+        ;;
+    --test)
+        G_SSID="" G_GATEWAY="" G_GW_LOSS=0 G_NET_LOSS=0
+        G_DNS_SYS="" G_DNS_EXT="" G_HTTPS="0" G_WIFI_INFO=""
+        run_checks
+        state=$(diagnose)
+        log "Test: state=$state SSID=${G_SSID:-none} GW=${G_GATEWAY:-none} GW_loss=${G_GW_LOSS}% Net_loss=${G_NET_LOSS}%"
+        send_email "[Network Watch] Test from $MACHINE_NAME" "$(format_startup_body)"
+        echo "Test complete. Check your inbox at ${ALERT_EMAIL:-<not configured>}."
+        ;;
+    *)
+        run_monitor
+        ;;
+esac
