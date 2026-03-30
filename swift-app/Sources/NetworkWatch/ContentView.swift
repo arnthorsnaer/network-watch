@@ -13,6 +13,12 @@ struct ContentView: View {
         Host.current().localizedName ?? "This Mac"
     }
 
+    private var versionString: String {
+        let v = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
+        let b = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "?"
+        return "v\(v) (\(b))"
+    }
+
     private var modeIndex: Int {
         DisplayMode.allCases.firstIndex(of: mode) ?? 0
     }
@@ -38,6 +44,8 @@ struct ContentView: View {
             HStack {
                 Text("Network Watch — \(machineName)")
                     .font(.headline)
+                Text(versionString)
+                    .font(.caption).foregroundColor(.secondary)
                 Spacer()
                 Text(now, format: .dateTime.day().month(.wide).year())
                     .font(.caption).foregroundColor(.secondary)

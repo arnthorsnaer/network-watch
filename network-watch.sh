@@ -14,6 +14,15 @@ source "$SCRIPT_DIR/.env"
 EMAIL_ENABLED=0; [[ -n "${ALERT_EMAIL:-}" ]] && EMAIL_ENABLED=1
 
 MACHINE_NAME=$(scutil --get ComputerName 2>/dev/null || hostname)
+_VER_FILE="$SCRIPT_DIR/VERSION"
+APP_VERSION=""; APP_BUILD=""
+if [[ -f "$_VER_FILE" ]]; then
+    APP_VERSION=$(sed -n '1p' "$_VER_FILE")
+    APP_BUILD=$(sed -n '2p' "$_VER_FILE")
+fi
+VERSION_STR=""
+[[ -n "$APP_VERSION" ]] && VERSION_STR="  v${APP_VERSION}${APP_BUILD:+ (${APP_BUILD})}"
+
 APP_SUPPORT="$HOME/Library/Application Support/NetworkWatch"
 DATA_FILE="$APP_SUPPORT/checks.csv"
 STATUS_FILE="$APP_SUPPORT/status"
@@ -180,8 +189,8 @@ draw_ui() {
 
     local term_w; term_w=$(tput cols 2>/dev/null || echo 80)
     local dstr; dstr=$(date '+%a %d %b, %H:%M')
-    local title_plain="  Network Watch — ${MACHINE_NAME}"
-    printf "  ${_BD}Network Watch — %s${_RS}" "$MACHINE_NAME"
+    local title_plain="  Network Watch — ${MACHINE_NAME}${VERSION_STR}"
+    printf "  ${_BD}Network Watch — %s${_RS}${_DM}%s${_RS}" "$MACHINE_NAME" "$VERSION_STR"
     printf '%*s%s\n' $(( term_w - ${#title_plain} - ${#dstr} )) '' "$dstr"
     echo
 

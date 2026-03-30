@@ -11,8 +11,15 @@ APP_NAME="NetworkWatch"
 APP_BUNDLE="$SCRIPT_DIR/${APP_NAME}.app"
 SWIFT_DIR="$SCRIPT_DIR/swift-app"
 
+VERSION=$(cat "$SCRIPT_DIR/VERSION" 2>/dev/null || echo "0.0.0")
+BUILD=$(cat "$SCRIPT_DIR/BUILD" 2>/dev/null || echo "0")
+
 BUILD_CONFIG="debug"
-[[ "${1:-}" == "--release" ]] && BUILD_CONFIG="release"
+if [[ "${1:-}" == "--release" ]]; then
+    BUILD_CONFIG="release"
+    BUILD=$(( BUILD + 1 ))
+    echo "$BUILD" > "$SCRIPT_DIR/BUILD"
+fi
 
 echo "Building Swift app (${BUILD_CONFIG})..."
 cd "$SWIFT_DIR"
@@ -37,7 +44,10 @@ chmod +x "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
 # Daemon + credentials
 cp "$SCRIPT_DIR/network-watchd" "$APP_BUNDLE/Contents/Resources/network-watchd"
 chmod +x "$APP_BUNDLE/Contents/Resources/network-watchd"
-cp "$SCRIPT_DIR/.env" "$APP_BUNDLE/Contents/Resources/.env"
+[[ -f "$SCRIPT_DIR/.env" ]] && cp "$SCRIPT_DIR/.env" "$APP_BUNDLE/Contents/Resources/.env"
+
+# Version file (read by daemon for CLI display)
+printf '%s\n' "$VERSION" "$BUILD" > "$APP_BUNDLE/Contents/Resources/VERSION"
 
 # App icon
 if [[ -f "$SWIFT_DIR/Resources/AppIcon.icns" ]]; then
@@ -45,7 +55,7 @@ if [[ -f "$SWIFT_DIR/Resources/AppIcon.icns" ]]; then
 fi
 
 # Info.plist
-cat > "$APP_BUNDLE/Contents/Info.plist" <<'EOF'
+cat > "$APP_BUNDLE/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -53,8 +63,8 @@ cat > "$APP_BUNDLE/Contents/Info.plist" <<'EOF'
     <key>CFBundleExecutable</key>      <string>NetworkWatch</string>
     <key>CFBundleIdentifier</key>      <string>com.networkwatch.app</string>
     <key>CFBundleName</key>            <string>NetworkWatch</string>
-    <key>CFBundleVersion</key>         <string>1.0</string>
-    <key>CFBundleShortVersionString</key> <string>1.0</string>
+    <key>CFBundleVersion</key>         <string>${BUILD}</string>
+    <key>CFBundleShortVersionString</key> <string>${VERSION}</string>
     <key>LSMinimumSystemVersion</key>  <string>12.0</string>
     <key>CFBundlePackageType</key>     <string>APPL</string>
     <key>CFBundleIconFile</key>        <string>AppIcon</string>
